@@ -1,22 +1,10 @@
 """
-PMOS 滑动验证码处理模块
-功能：获取验证码 + 滑动滑块完整流程
-
+PMOS 滑动验证码识别模块
 核心原理：二维边缘轮廓形状匹配 - 专杀同水平线上1真多假缺口
-
-使用示例:
-    from z import CaptchaHandler
-
-    handler = CaptchaHandler(debug=True)
-    success = handler.solve_captcha(page, slider_element)
 """
 
 import numpy as np
 import os
-import time
-import random
-import base64
-from typing import Optional, Tuple, Dict, Any, List
 
 try:
     import cv2
@@ -25,87 +13,43 @@ except ImportError:
     HAS_OPENCV = False
     print("提示: opencv-python 未安装")
 
+from constants import (
+    CaptchaConstants,
+    PathConstants
+)
 
-# ==================== 常量定义 ====================
-
-class CaptchaConstants:
-    """验证码相关常量"""
-
-    # 默认滑块宽度（像素）
-    DEFAULT_SLIDER_WIDTH = 60
-
-    # 滑块宽度范围
-    SLIDER_WIDTH_MIN = 40
-    SLIDER_WIDTH_MAX = 100
-
-    # 搜索范围（缺口位置）
-    GAP_SEARCH_START_X = 50
-    GAP_SEARCH_END_RATIO = 0.7
-    GAP_SEARCH_MAX_X = 300
-
-    # 基础补偿比例（滑块宽度的百分比）
-    BASE_OFFSET_RATIO = 0.12
-
-    # 自适应补偿范围（像素）
-    ADAPTIVE_OFFSET_MIN = -15
-    ADAPTIVE_OFFSET_MAX = 10
-
-    # 最大重试次数
-    MAX_RETRY = 6
-
-    # 验证码检查等待时间（秒）
-    CAPTCHA_CHECK_WAIT = 1.5
-    CAPTCHA_REFRESH_WAIT = 0.5
-
-
-class DragConstants:
-    """拖动轨迹相关常量"""
-
-    # 延迟时间（毫秒）
-    DELAY_START_MIN = 8
-    DELAY_START_MAX = 20
-    DELAY_MIDDLE_MIN = 6
-    DELAY_MIDDLE_MAX = 15
-    DELAY_END_MIN = 20
-    DELAY_END_MAX = 50
-
-    # 随机偏移（像素）
-    RANDOM_OFFSET_MIN = -2
-    RANDOM_OFFSET_MAX = 2
-    Y_JITTER_MIN = -1
-    Y_JITTER_MAX = 1
-
-
-# ==================== 验证码识别核心类 ====================
 
 class CaptchaSolver:
     """验证码求解器 - 二维边缘轮廓匹配"""
 
-    # 自适应补偿相关（类变量）
-    _global_offset_history = []
-    _success_count = 0
-    _failure_count = 0
+    # 自适应补偿相关
+    _global_offset_history = []  # 全局补偿历史
+    _success_count = 0  # 成功次数
+    _failure_count = 0  # 失败次数
 
     def __init__(self, debug=True, max_retry=None, enable_adaptive=True):
         self.has_opencv = HAS_OPENCV
         self.debug = debug
-        self.debug_dir = "debug_captcha"
+        self.debug_dir = PathConstants.DEBUG_CAPTCHA_DIR
         self.max_retry = max_retry or CaptchaConstants.MAX_RETRY
         self.enable_adaptive = enable_adaptive
 
-        # 补偿参数
+        # 补偿参数（可调）
         self.base_offset_ratio = CaptchaConstants.BASE_OFFSET_RATIO
-        self.adaptive_offset = 0
-        self.offset_range = (
-            CaptchaConstants.ADAPTIVE_OFFSET_MIN,
-            CaptchaConstants.ADAPTIVE_OFFSET_MAX
-        )
+        self.adaptive_offset = 0  # 自适应补偿值
+        self.offset_range = (CaptchaConstants.ADAPTIVE_OFFSET_MIN,
+                            CaptchaConstants.ADAPTIVE_OFFSET_MAX)
 
         if debug:
             os.makedirs(self.debug_dir, exist_ok=True)
 
     def record_result(self, offset, success):
-        """记录验证结果用于自适应学习"""
+        """
+        记录验证结果用于自适应学习
+        Args:
+            offset: 使用的补偿值
+            success: 是否验证成功
+        """
         if not self.enable_adaptive:
             return
 
@@ -141,7 +85,10 @@ class CaptchaSolver:
             self.adaptive_offset = new_offset
 
     def get_adaptive_suggestions(self, base_distance):
-        """获取自适应补偿建议"""
+        """
+        获取自适应补偿建议
+        Returns: 优先级排序的补偿值列表
+        """
         suggestions = []
 
         if abs(self.adaptive_offset) > 0.5:
@@ -168,20 +115,39 @@ class CaptchaSolver:
         cls._success_count = 0
         cls._failure_count = 0
 
-    # ==================== 核心识别方法 ====================
+    # ==================== 核心方法 ====================
 
     def get_slide_distance(self, bg_image, slider_image=None, slider_info=None):
         """
         专杀同一水平线上 1真多假 验证码
         核心原理：二维边缘形状交叉互相关匹配 + 阴影补偿
-
+        
+        算法背景：
+        现代滑动验证码常在同一个水平线上设置多个相似的缺口（1个真实缺口 + 多个假缺口），
+        仅靠传统的边缘检测无法准确识别。本算法采用二维轮廓匹配技术，通过对比滑块形状和背景
+        边缘的相似度，精准定位真实缺口。
+        
+        技术路线：
+        1. 提取滑块真实形状和Y坐标：从RGBA滑块图中提取透明通道，获取精确的拼图形状
+        2. 截取背景图水平带：根据滑块Y坐标，只处理相关水平区域，减少干扰
+        3. 边缘提取：使用Canny算法提取背景和滑块的边缘特征
+        4. 形状匹配：使用OpenCV的模板匹配（TM_CCOEFF_NORMED）计算形状相似度
+        5. 补偿修正：应用阴影补偿和初始边距补偿，修正匹配误差
+        6. 结果验证：排除左侧初始坑位干扰，返回最佳匹配位置
+        
+        关键创新：
+        - 二维轮廓匹配：不只是水平投影，而是完整的二维形状匹配
+        - 透明通道利用：通过RGBA透明通道精确提取拼图形状，排除黑色边框干扰
+        - 阴影补偿：缺口边缘的阴影会导致匹配位置偏左，需补偿8-12像素
+        - 自适应学习：根据历史成功记录动态调整补偿值（enable_adaptive=True时）
+        
         Args:
-            bg_image: 背景图片（bytes或numpy数组）
-            slider_image: 滑块图片（bytes或numpy数组，竖条RGBA格式）
-            slider_info: 滑块信息字典
+            bg_image: 背景图片（bytes或numpy数组），包含缺口的完整验证码图
+            slider_image: 滑块图片（bytes或numpy数组，竖条RGBA格式，带透明通道），拼图块图像
+            slider_info: 滑块信息字典（兼容旧版），包含滑块位置、尺寸等信息
 
         Returns:
-            (gap_x, gap_y, confidence) 缺口位置和置信度
+            (gap_x, gap_y, confidence): 缺口在背景图中的X坐标、Y坐标和匹配置信度(0-1)
         """
         if not self.has_opencv:
             return (180, None, 0.5)
@@ -195,7 +161,11 @@ class CaptchaSolver:
         if self.debug:
             cv2.imwrite(f"{self.debug_dir}/01_original_bg.png", bg_img)
 
-        # 提取滑块真实形状和 Y 坐标
+        # ==================== 第一步：提取滑块真实形状和 Y 坐标 ====================
+        # 目的：从RGBA滑块图中提取精确的拼图形状和位置信息
+        # 原理：RGBA图像中的透明通道（Alpha）可以准确区分拼图形状和背景
+        #      通过分析透明像素的分布，确定拼图块的边界框（bounding box）
+        # 输出：y_start, y_end（垂直范围），x_start（水平起始偏移），slider_rgba（裁剪后的RGBA图像）
         if slider_image is None:
             print("[二维匹配] 无滑块图片，回退到边缘检测")
             return self._fallback_edge_detection(bg_img, slider_info)
@@ -206,60 +176,127 @@ class CaptchaSolver:
             print("[二维匹配] 提取滑块形状失败，回退到边缘检测")
             return self._fallback_edge_detection(bg_img, slider_info)
 
-        # 截取背景图的 Y 轴水平带
+        # ==================== 第二步：截取背景图的 Y 轴水平带 ====================
+        # 目的：缩小处理范围，提高匹配精度和计算效率
+        # 原理：由于滑块只在特定的Y轴范围内移动，只需处理该水平带区域即可
+        #      上下各加5像素容错，防止因坐标计算误差导致拼图块被截断
+        # 容错：上下各加 5 像素
         strip_y_start = max(0, y_start - 5)
         strip_y_end = min(h, y_end + 5)
         bg_strip = bg_img[strip_y_start:strip_y_end, :]
 
-        # 处理背景边缘
+        # ==================== 第三步：处理背景边缘 ====================
+        # 目的：提取背景图的边缘特征，用于形状匹配
+        # 处理流程：
+        # 1. 灰度化：将BGR图像转换为灰度图，减少计算维度
+        # 2. 高斯模糊：使用3x3高斯核平滑图像，消除噪声干扰
+        # 3. Canny边缘检测：提取图像中的边缘特征，阈值为50-150
         bg_gray = cv2.cvtColor(bg_strip, cv2.COLOR_BGR2GRAY)
         bg_blur = cv2.GaussianBlur(bg_gray, (3, 3), 0)
         bg_edges = cv2.Canny(bg_blur, 50, 150)
 
-        # 处理滑块边缘
+        # ==================== 第四步：处理滑块边缘 ====================
+        # 目的：提取滑块拼图块的边缘特征，用于与背景边缘进行匹配
+        # 处理流程与背景边缘处理类似，但输入是RGBA图像（需要先转换为灰度）
+        # 注意：slider_rgba是带有透明通道的裁剪后拼图块图像
         slider_gray = cv2.cvtColor(slider_rgba, cv2.COLOR_BGRA2GRAY)
         slider_blur = cv2.GaussianBlur(slider_gray, (3, 3), 0)
         slider_edges = cv2.Canny(slider_blur, 50, 150)
 
-        # 消除滑块外围方形黑边的干扰
+        # ==================== 第五步：消除滑块外围方形黑边的干扰 ====================
+        # 目的：去除滑块图像中可能存在的黑色边框，只保留真正的拼图形状
+        # 问题：许多滑块验证码会在拼图块周围添加黑色边框，干扰边缘检测
+        # 解决方案：利用RGBA图像的透明通道（Alpha）创建掩膜，只保留非透明区域
+        
+        # 利用 Alpha 透明通道，把真正的"拼图曲线轮廓"筛出来
+        # 原理：透明通道中，透明部分（alpha=0）为背景，不透明部分（alpha>0）为拼图形状
         alpha_channel = slider_rgba[:, :, 3]
         _, mask = cv2.threshold(alpha_channel, 10, 255, cv2.THRESH_BINARY)
 
+        # 腐蚀掩膜，去除抗锯齿产生的脏边缘
+        # 腐蚀操作可以消除边缘的半透明像素，确保掩膜边界清晰
         kernel = np.ones((2, 2), np.uint8)
         mask_eroded = cv2.erode(mask, kernel, iterations=1)
+
+        # 运用掩膜，slider_edges 只剩下干干净净的拼图形状！
+        # 按位与操作：只保留掩膜区域内的边缘像素
         slider_edges = cv2.bitwise_and(slider_edges, mask_eroded)
 
-        # 二维交叉互相关匹配
+        # ==================== 第六步：二维交叉互相关匹配 ====================
+        # 目的：在背景边缘图中查找与滑块边缘形状最匹配的位置
+        # 算法：OpenCV的模板匹配（matchTemplate）算法
+        # 匹配方法：TM_CCOEFF_NORMED（归一化相关系数匹配）
+        #   - 优点：对光照变化、对比度变化高度鲁棒，只关注形状相似度
+        #   - 原理：计算模板图像和源图像的归一化互相关系数，值越接近1表示匹配度越高
+        # 输出：result矩阵，每个位置表示该处模板匹配的相似度得分
         result = cv2.matchTemplate(bg_edges, slider_edges, cv2.TM_CCOEFF_NORMED)
 
-        # 排除左侧初始坑位
+        # ==================== 第七步：排除左侧初始坑位 ====================
+        # 目的：排除滑块初始位置（最左侧）的干扰匹配
+        # 问题：滑块验证码在最左侧通常有一个初始坑位（滑块原本的位置），
+        #      这个坑位的形状与滑块完全一致，会导致误匹配
+        # 解决方案：将结果矩阵左侧区域（滑块宽度+20像素）的匹配得分设为-1（最低分）
+        #   - 20像素的额外容差：防止因图像缩放或渲染导致的微小偏移
         ignore_width = slider_rgba.shape[1] + 20
-        result[:, :ignore_width] = -1.0
+        result[:, :ignore_width] = -1.0  # 把左侧匹配得分强行置为极低
 
-        # 找出匹配度最高的位置
+        # ==================== 第八步：找出匹配度最高的位置 ====================
+        # 目的：从匹配结果矩阵中找到相似度最高的位置
+        # 函数：cv2.minMaxLoc() 查找矩阵中的最小值和最大值及其位置
+        # 返回值：
+        #   min_val: 最小匹配得分（最不相似）
+        #   max_val: 最大匹配得分（最相似，范围[-1, 1]，越接近1匹配度越高）
+        #   min_loc: 最小值位置（最不相似的位置）
+        #   max_loc: 最大值位置（最相似的位置）
         min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
 
+        # 最佳匹配位置：max_loc[0]为X坐标，Y坐标取滑块垂直范围的中点
         best_x = max_loc[0]
         best_y = (y_start + y_end) // 2
 
         print(f"[二维轮廓匹配] 原始最佳X: {best_x}, 匹配得分: {max_val:.3f}")
 
-        # 距离补偿逻辑
+        # ==================== 核心修复：距离补偿逻辑 ====================
+        # 目的：修正匹配位置与实际缺口位置之间的系统误差
+        # 误差来源分析：
+        # 1. 阴影效应：缺口左侧通常有暗色阴影，边缘检测会捕捉到阴影的外边缘而非缺口真实边缘
+        # 2. 腐蚀操作：第五步中的掩膜腐蚀使滑块轮廓"瘦"了一圈，导致匹配位置向左偏移
+        # 3. 透明边距：滑块图像左侧可能有透明空白区域，影响实际位置计算
+        
+        # 补偿1：阴影与腐蚀补偿
+        # 背景缺口的左边缘有暗色阴影，边缘检测会把阴影的最外层当成边缘
+        # 另外腐蚀操作让滑块轮廓"瘦"了一圈，导致匹配位置偏左
+        # 通常在 5 到 12 之间，根据实际效果调整
         shadow_compensation = 8
+
+        # 补偿2：初始透明边距
+        # 有些滑块图左侧有几像素的透明空白
+        # 注意：此处的initial_padding仅用于信息输出，实际补偿已包含在shadow_compensation中
         initial_padding = x_start if x_start else 0
+
+        # 最终实际应该滑动的像素距离
+        # 匹配到的绝对坐标 + 阴影偏差补偿
         compensated_x = best_x + shadow_compensation
+
+        # 确保在合理范围内
+        # 下限：避开左侧初始坑位区域（ignore_width）
+        # 上限：不超过背景图宽度减去滑块宽度
         compensated_x = max(ignore_width, min(compensated_x, w - slider_rgba.shape[1]))
 
-        print(f"[二维轮廓匹配] 补偿后最终滑动距离: {compensated_x} (阴影补偿+{shadow_compensation}px)")
+        print(f"[二维轮廓匹配] 补偿后最终滑动距离: {compensated_x} (阴影补偿+{shadow_compensation}px, 初始边距={initial_padding}px)")
+        # ================================================================
 
-        # 保存调试图
+        # ==================== 第九步：保存调试图 ====================
         if self.debug:
             cv2.imwrite(f"{self.debug_dir}/02_bg_edges_strip.png", bg_edges)
             cv2.imwrite(f"{self.debug_dir}/03_slider_edges_clean.png", slider_edges)
 
             debug_img = bg_img.copy()
+            # 画水平带范围（蓝框）
             cv2.rectangle(debug_img, (0, strip_y_start), (w, strip_y_end), (255, 0, 0), 1)
+            # 画原始匹配位置（红框，偏左的）
             cv2.rectangle(debug_img, (best_x, strip_y_start), (best_x + slider_rgba.shape[1], strip_y_end), (0, 0, 255), 1)
+            # 画补偿后位置（绿框，真正吻合的）
             cv2.rectangle(debug_img, (compensated_x, strip_y_start), (compensated_x + slider_rgba.shape[1], strip_y_end), (0, 255, 0), 2)
             cv2.circle(debug_img, (best_x, best_y), 5, (0, 0, 255), -1)
             cv2.imwrite(f"{self.debug_dir}/04_final_match.png", debug_img)
@@ -267,10 +304,34 @@ class CaptchaSolver:
         return (compensated_x, best_y, max_val)
 
     def _extract_slider_info_rgba(self, slider_img_data):
-        """解析竖向滑块图，提取精确的 Y 坐标和滑块RGBA图"""
+        """
+        解析竖向滑块图，提取精确的 Y 坐标和 X 坐标，并返回带有透明通道的真实滑块小图
+        
+        核心功能：从RGBA格式的滑块图像中提取拼图块的精确边界和形状
+        技术原理：利用透明通道（Alpha）区分拼图形状和背景，通过非透明像素的分布确定边界框
+        
+        处理步骤：
+        1. 图像解码：使用cv2.IMREAD_UNCHANGED模式读取RGBA四通道图像
+        2. 透明通道提取：获取Alpha通道（第4通道）
+        3. 边界检测：找到所有非透明像素（alpha > 0）的坐标，计算最小/最大X、Y值
+        4. 图像裁剪：根据边界框裁剪出纯拼图形状（去除透明背景）
+        5. 调试输出：可选保存可视化图像用于调试
+        
+        关键点：
+        - 必须使用IMREAD_UNCHANGED保留透明通道，否则会丢失关键信息
+        - 通过alpha > 0的阈值判断非透明像素，避免半透明像素的干扰
+        - 返回的裁剪图像slider_rgba是去除了周围透明背景的纯拼图形状
+        
+        Returns:
+            (y_start, y_end, x_start, slider_rgba) - Y坐标范围、X坐标初始偏移和滑块RGBA图
+            - y_start, y_end: 拼图块在原始图像中的垂直范围（像素）
+            - x_start: 拼图块在原始图像中的水平起始偏移（像素）
+            - slider_rgba: 裁剪后的RGBA图像，只包含拼图形状，尺寸为(y_end-y_start+1) x (x_end-x_start+1)
+        """
         if not self.has_opencv:
             return None, None, None, None
 
+        # 必须使用 IMREAD_UNCHANGED 保留 RGBA 四个通道
         if isinstance(slider_img_data, bytes):
             arr = np.frombuffer(slider_img_data, np.uint8)
             slider_img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
@@ -280,10 +341,12 @@ class CaptchaSolver:
             slider_img = slider_img_data
 
         if slider_img is None or len(slider_img.shape) < 3 or slider_img.shape[2] != 4:
+            print(f"[滑块提取] 警告：滑块不是RGBA格式！shape={slider_img.shape if slider_img is not None else None}")
             return None, None, None, None
 
         alpha_channel = slider_img[:, :, 3]
 
+        # 找到非透明像素的边界
         y_coords, x_coords = np.where(alpha_channel > 0)
         if len(y_coords) == 0:
             return None, None, None, None
@@ -291,11 +354,13 @@ class CaptchaSolver:
         y_start, y_end = np.min(y_coords), np.max(y_coords)
         x_start, x_end = np.min(x_coords), np.max(x_coords)
 
+        # 截取真实的滑块拼图（包含 RGBA）
         cropped_slider_rgba = slider_img[y_start:y_end+1, x_start:x_end+1]
 
-        print(f"[滑块提取] 原始尺寸: {slider_img.shape}, 滑块范围: Y=[{y_start},{y_end}], X偏移={x_start}")
+        print(f"[滑块提取] 原始尺寸: {slider_img.shape}, 滑块范围: Y=[{y_start},{y_end}], X偏移={x_start}, 切图尺寸: {cropped_slider_rgba.shape}")
 
         if self.debug:
+            # 保存可视化图（透明背景转白色）
             display_img = cropped_slider_rgba.copy()
             white_bg = np.ones((display_img.shape[0], display_img.shape[1], 3), dtype=np.uint8) * 255
             mask = display_img[:, :, 3] > 0
@@ -305,9 +370,34 @@ class CaptchaSolver:
         return y_start, y_end, x_start, cropped_slider_rgba
 
     def _fallback_edge_detection(self, bg_img, slider_info):
-        """备用方法：当没有滑块图片时，使用边缘检测"""
+        """
+        备用方法：当没有滑块图片时，使用边缘检测
+        
+        应用场景：当无法获取滑块拼图块图像时，回退到传统的边缘检测方法
+        技术原理：基于Canny边缘检测和水平投影分析，识别缺口位置
+        
+        处理流程：
+        1. 确定Y轴范围：优先使用slider_info中的Y坐标，否则从背景图左侧区域检测
+        2. 边缘检测：对背景图进行灰度化、高斯模糊、Canny边缘提取
+        3. Y轴掩膜：根据确定的Y范围创建掩膜，只处理相关水平带
+        4. 缺口检测：通过边缘的水平投影分析，寻找缺口位置（边缘密度较低的区域）
+        5. 结果返回：返回检测到的缺口X坐标、Y坐标和置信度
+        
+        局限性：
+        - 无法处理同一水平线上的多个假缺口（1真多假场景）
+        - 对图像噪声和复杂背景较为敏感
+        - 准确率低于基于滑块形状的二维匹配方法
+        
+        参数：
+            bg_img: 背景图像（numpy数组）
+            slider_info: 滑块信息字典，可能包含Y坐标信息
+        
+        返回：
+            (gap_x, gap_y, confidence): 缺口位置和置信度
+        """
         h, w = bg_img.shape[:2]
 
+        # 尝试获取滑块Y坐标
         y_start, y_end = 0, h
         slider_width = 60
 
@@ -316,6 +406,7 @@ class CaptchaSolver:
                 slider_y = slider_info['y']
                 y_start = max(0, int(slider_y) - 10)
                 y_end = min(h, int(slider_y) + slider_width + 10)
+                print(f"[备用检测] 从slider_info提取Y: {slider_y}")
 
         if y_start == 0 and y_end == h:
             y_start, y_end = self._detect_slider_y_from_bg(bg_img, w, h)
@@ -325,6 +416,7 @@ class CaptchaSolver:
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         edges = cv2.Canny(blurred, 50, 150)
 
+        # Y轴掩膜
         if y_end > y_start and (y_end - y_start) < h * 0.8:
             mask = np.zeros_like(edges)
             mask_y_start = max(0, y_start - 5)
@@ -341,7 +433,30 @@ class CaptchaSolver:
         return (min(w - 50, 200), h // 2, 0.3)
 
     def _detect_slider_y_from_bg(self, img, w, h):
-        """从背景图检测滑块Y轴范围"""
+        """
+        从背景图检测滑块Y轴范围
+        
+        核心算法：基于垂直边缘密度分析的滑块位置检测
+        技术原理：滑块通常位于图像左侧，其垂直边缘密度较高，通过分析左侧区域的边缘分布确定Y坐标
+        
+        处理步骤：
+        1. 区域选择：截取图像左侧区域（宽度为min(80, w//4)），这是滑块最可能出现的区域
+        2. 边缘检测：对左侧区域进行灰度化、Canny边缘提取
+        3. 垂直投影：计算每行的边缘像素总和（row_edges = np.sum(edges, axis=1)）
+        4. 平滑处理：使用5像素的均值滤波器平滑投影曲线，减少噪声影响
+        5. 峰值检测：找到平滑后曲线的最大值位置，作为滑块的垂直中心
+        6. 范围确定：以峰值位置为中心，上下扩展一定范围（通常±30-40像素）
+        
+        应用场景：当无法从滑块图像或滑块信息中获取Y坐标时，使用此方法估计滑块垂直位置
+        
+        参数：
+            img: 背景图像（numpy数组，BGR格式）
+            w: 图像宽度（像素）
+            h: 图像高度（像素）
+        
+        返回：
+            (y_start, y_end): 滑块估计的垂直范围（起始Y坐标，结束Y坐标）
+        """
         left_roi = img[:, :min(80, w // 4)]
         gray = cv2.cvtColor(left_roi, cv2.COLOR_BGR2GRAY)
         edges = cv2.Canny(gray, 50, 150)
@@ -359,7 +474,35 @@ class CaptchaSolver:
         return 0, h
 
     def _detect_gap_x_by_edge(self, edges, h, w, slider_width):
-        """通过边缘的水平投影检测缺口的X位置"""
+        """
+        通过边缘的水平投影检测缺口的X位置
+        
+        核心算法：基于边缘密度分析的峰值检测方法
+        技术原理：计算每列像素的边缘密度（边缘像素数量），缺口位置通常表现为边缘密度较高的峰值
+        
+        处理步骤：
+        1. 水平投影：计算每列的边缘像素总和（col_edges = np.sum(edges, axis=0)）
+        2. 平滑处理：使用卷积核（3像素和7像素）对投影曲线进行双重平滑，减少噪声干扰
+        3. 基线计算：在有效区域（start_x到end_x）计算边缘密度的均值和标准差
+        4. 峰值检测：遍历有效区域，寻找超过阈值（均值+0.8*标准差）的局部最大值
+        5. 评分排序：根据峰值强度和锐度对候选位置进行评分，选择最佳位置
+        6. 补偿修正：应用基础补偿和自适应补偿，修正检测位置
+        
+        关键优化：
+        - 双重平滑：结合短期（3像素）和长期（7像素）平滑，平衡噪声抑制和细节保留
+        - 自适应阈值：基于局部统计特性动态调整峰值检测阈值
+        - 锐度评估：通过峰值与周围区域的对比度评估缺口质量
+        - 补偿机制：根据滑块宽度比例和自适应学习结果进行位置补偿
+        
+        参数：
+            edges: 边缘图像（二值图，边缘像素为255）
+            h: 图像高度（像素）
+            w: 图像宽度（像素）
+            slider_width: 滑块宽度（像素），用于补偿计算
+        
+        返回：
+            int or None: 检测到的缺口X坐标，如果未找到则返回None
+        """
         col_edges = np.sum(edges, axis=0)
 
         col_edges_smooth1 = np.convolve(col_edges, np.ones(3) / 3, mode='same')
@@ -405,6 +548,10 @@ class CaptchaSolver:
         candidates.sort(key=lambda c: c[1], reverse=True)
         best_x, best_score = candidates[0]
 
+        min_score = (base_std * 2) if base_std > 10 else 50
+        if best_score < min_score:
+            print(f"[边缘检测X] 得分不足: {best_score:.1f}")
+
         base_offset = int(slider_width * self.base_offset_ratio)
         total_offset = base_offset + self.adaptive_offset
 
@@ -423,686 +570,3 @@ class CaptchaSolver:
         elif isinstance(image, np.ndarray):
             return image
         return None
-
-
-# ==================== 验证码处理主类 ====================
-
-class CaptchaHandler:
-    """验证码处理器 - 完整的获取验证码和滑动流程"""
-
-    def __init__(self, debug=True, max_retry=None):
-        """
-        初始化验证码处理器
-
-        Args:
-            debug: 是否开启调试模式（保存调试图）
-            max_retry: 最大重试次数
-        """
-        self.debug = debug
-        self.captcha_solver = CaptchaSolver(debug=debug, max_retry=max_retry)
-
-    def find_slider_element(self, page):
-        """
-        查找滑块元素
-
-        Args:
-            page: Playwright页面对象
-
-        Returns:
-            滑块元素或None
-        """
-        captcha_configs = [
-            {"slider": ".verify-move-block", "track": ".verify-left-bar", "check": ".verify-bar-area"},
-            {"slider": "#nc_1__scale_text", "track": ".nc_1__scale_text", "check": ".yidun_intelligence"},
-            {"slider": "[class*='slider-btn']", "track": "[class*='slider-track']", "check": "[class*='captcha']"},
-        ]
-
-        for config in captcha_configs:
-            try:
-                if page.query_selector(config["check"]):
-                    slider = page.wait_for_selector(config["slider"], timeout=1000)
-                    if slider:
-                        return slider
-            except:
-                continue
-
-        # 模糊匹配
-        fuzzy_selectors = ["[class*='slider-btn']", "[class*='slide-btn']", ".yidun_slider__icon"]
-        for selector in fuzzy_selectors:
-            try:
-                elements = page.query_selector_all(selector)
-                for elem in elements:
-                    if elem.is_visible():
-                        return elem
-            except:
-                continue
-
-        return None
-
-    def get_captcha_images(self, page, container):
-        """
-        获取验证码图片
-
-        Args:
-            page: Playwright页面对象
-            container: 验证码容器元素
-
-        Returns:
-            (bg_image, block_image, img_offset) 背景图、滑块图和偏移信息
-        """
-        bg_image = None
-        block_image = None
-        img_offset = None
-
-        try:
-            result = page.evaluate("""
-                () => {
-                    const allImages = [];
-                    const selectors = [
-                        '.verify-img-panel img',
-                        '.verify-img-out img',
-                        '.verify-area img',
-                        '.verify-img-panel canvas',
-                        '.verify-img-out canvas',
-                        '.verify-area canvas'
-                    ];
-
-                    for (const sel of selectors) {
-                        const elems = document.querySelectorAll(sel);
-                        elems.forEach((el, idx) => {
-                            if (el.offsetParent !== null) {
-                                const rect = el.getBoundingClientRect();
-                                let src = null;
-
-                                if (el.tagName === 'CANVAS') {
-                                    try {
-                                        src = el.toDataURL('image/png');
-                                    } catch(e) {}
-                                } else if (el.tagName === 'IMG') {
-                                    src = el.src;
-                                }
-
-                                if (src) {
-                                    const container = document.querySelector('.verify-img-panel, .verify-img-out, .verify-area');
-                                    let offsetX = 0, offsetY = 0;
-                                    if (container) {
-                                        const containerRect = container.getBoundingClientRect();
-                                        offsetX = rect.left - containerRect.left;
-                                        offsetY = rect.top - containerRect.top;
-                                    }
-
-                                    allImages.push({
-                                        src: src,
-                                        width: Math.round(rect.width),
-                                        height: Math.round(rect.height),
-                                        area: Math.round(rect.width * rect.height),
-                                        offsetX: Math.round(offsetX),
-                                        offsetY: Math.round(offsetY)
-                                    });
-                                }
-                            }
-                        });
-                    }
-
-                    allImages.sort((a, b) => b.area - a.area);
-                    return { count: allImages.length, images: allImages };
-                }
-            """)
-
-            if result:
-                images = result.get('images', [])
-                if images:
-                    img_info = images[0]
-                    src = img_info.get('src')
-                    if src:
-                        bg_image = self._fetch_image_data(page, src)
-                        img_offset = {
-                            'x': img_info.get('offsetX', 0),
-                            'y': img_info.get('offsetY', 0),
-                            'width': img_info.get('width', 0),
-                            'height': img_info.get('height', 0)
-                        }
-
-        except Exception as e:
-            print(f"[验证码] 获取背景图出错: {e}")
-
-        # 获取滑块拼图
-        try:
-            slider_bg = page.evaluate("""
-                () => {
-                    const slider = document.querySelector('.verify-move-block');
-                    if (!slider) return null;
-
-                    const style = window.getComputedStyle(slider);
-                    const bgImage = style.backgroundImage;
-
-                    if (bgImage && bgImage !== 'none') {
-                        const match = bgImage.match(/url\\(['"]?([^'"]+)['"]?\\)/);
-                        if (match) {
-                            return { src: match[1], method: 'background' };
-                        }
-                    }
-
-                    const img = slider.querySelector('img');
-                    if (img && img.src) {
-                        return { src: img.src, method: 'child_img' };
-                    }
-
-                    return null;
-                }
-            """)
-
-            if slider_bg:
-                src = slider_bg.get('src')
-                if src:
-                    block_image = self._fetch_image_data(page, src)
-
-        except Exception as e:
-            print(f"[验证码] 获取拼图块出错: {e}")
-
-        # 兜底
-        if not bg_image:
-            try:
-                bg_image = container.screenshot()
-            except:
-                pass
-
-        return bg_image, block_image, img_offset
-
-    def _fetch_image_data(self, page, src):
-        """获取图片数据"""
-        if not src:
-            return None
-
-        if src.startswith('data:image'):
-            try:
-                return base64.b64decode(src.split(',', 1)[1])
-            except:
-                pass
-
-        try:
-            result = page.evaluate(f"""
-                async () => {{
-                    const url = '{src}';
-                    try {{
-                        const response = await fetch(url);
-                        const blob = await response.blob();
-                        return new Promise((resolve) => {{
-                            const reader = new FileReader();
-                            reader.onloadend = () => resolve(reader.result);
-                            reader.readAsDataURL(blob);
-                        }});
-                    }} catch(e) {{
-                        return null;
-                    }}
-                }}
-            """)
-            if result and result.startswith('data:image'):
-                return base64.b64decode(result.split(',', 1)[1])
-        except:
-            pass
-
-        return None
-
-    def get_captcha_positions(self, page, slider_element):
-        """
-        获取验证码各元素位置
-
-        Args:
-            page: Playwright页面对象
-            slider_element: 滑块元素
-
-        Returns:
-            (slider_box, track_box, container_box, bg_image, block_image, img_offset)
-        """
-        slider_box = slider_element.bounding_box()
-        track = page.query_selector(".verify-bar-area, .verify-left-bar")
-        track_box = track.bounding_box() if track else None
-        container = page.query_selector(".verify-img-panel, .verify-img-out, .verify-area")
-        container_box = container.bounding_box() if container else None
-
-        if not (slider_box and track_box and container_box):
-            return None
-
-        bg_image, block_image, img_offset = self.get_captcha_images(page, container)
-
-        print(f"[定位] 滑块位置: x={slider_box['x']:.1f}, width={slider_box['width']:.1f}")
-        print(f"[定位] 容器位置: x={container_box['x']:.1f}, width={container_box['width']:.1f}")
-        if img_offset:
-            print(f"[定位] 图片相对容器偏移: x={img_offset['x']:.1f}, y={img_offset['y']:.1f}")
-
-        return slider_box, track_box, container_box, bg_image, block_image, img_offset
-
-    def simulate_drag(self, page, slider_element, distance):
-        """
-        模拟拖动滑块
-
-        Args:
-            page: Playwright页面对象
-            slider_element: 滑块元素
-            distance: 滑动距离
-
-        Returns:
-            是否成功拖动
-        """
-        if not distance or distance < 50:
-            distance = 200
-
-        slider_box = slider_element.bounding_box()
-        if not slider_box:
-            return False
-
-        start_x = slider_box['x'] + slider_box['width'] / 2
-        start_y = slider_box['y'] + slider_box['height'] / 2
-
-        print(f"[拖动] 起点=({start_x:.1f}, {start_y:.1f}), 距离={distance:.1f}px")
-
-        tracks = self._generate_drag_tracks(distance)
-
-        try:
-            offset_x = random.randint(DragConstants.RANDOM_OFFSET_MIN, DragConstants.RANDOM_OFFSET_MAX)
-            offset_y = random.randint(DragConstants.RANDOM_OFFSET_MIN, DragConstants.RANDOM_OFFSET_MAX)
-            page.mouse.move(start_x + offset_x, start_y + offset_y)
-            time.sleep(random.randint(100, 300) / 1000)
-
-            page.mouse.down()
-            time.sleep(random.randint(80, 150) / 1000)
-
-            for i, track in enumerate(tracks):
-                y_jitter = random.randint(DragConstants.Y_JITTER_MIN, DragConstants.Y_JITTER_MAX)
-                page.mouse.move(start_x + track['x'], start_y + y_jitter)
-
-                progress = i / len(tracks)
-                if progress < 0.3:
-                    time.sleep(track['delay'] * 0.8)
-                elif progress < 0.7:
-                    time.sleep(track['delay'])
-                else:
-                    time.sleep(track['delay'] * 1.2)
-
-            time.sleep(random.randint(50, 150) / 1000)
-            page.mouse.up()
-            print(f"[拖动] 完成，共{len(tracks)}步")
-            return True
-
-        except Exception as e:
-            print(f"[拖动] 出错: {e}")
-            return False
-
-    def _generate_drag_tracks(self, distance):
-        """
-        生成拖动轨迹 - 模拟人类真实行为
-
-        Args:
-            distance: 滑动距离
-
-        Returns:
-            轨迹点列表
-        """
-        tracks = []
-
-        # 随机选择人类行为模式
-        behavior = random.choice(['normal', 'normal', 'normal', 'cautious', 'fast', 'jitter'])
-
-        # 根据行为模式设置参数
-        if behavior == 'normal':
-            num_points = random.randint(20, 30)
-            base_speed = 1.0
-            jitter_amount = 0.5
-        elif behavior == 'cautious':
-            num_points = random.randint(30, 45)
-            base_speed = 1.3
-            jitter_amount = 0.3
-        elif behavior == 'fast':
-            num_points = random.randint(15, 22)
-            base_speed = 0.7
-            jitter_amount = 0.8
-        else:  # jitter
-            num_points = random.randint(25, 40)
-            base_speed = 1.0
-            jitter_amount = 1.5
-
-        for i in range(num_points):
-            progress = i / (num_points - 1)
-
-            # 使用更自然的缓动曲线 - easeInOutCubic
-            if progress < 0.5:
-                eased = 4 * progress * progress * progress
-            else:
-                eased = 1 - pow(-2 * progress + 2, 3) / 2
-
-            # 添加人类行为特征
-            if behavior == 'cautious':
-                if progress < 0.2:
-                    eased *= 0.7
-                elif progress > 0.7:
-                    eased = 0.7 + (eased - 0.7) * 0.5
-            elif behavior == 'fast':
-                if progress < 0.3:
-                    eased *= 1.2
-            elif behavior == 'jitter':
-                jitter = random.uniform(-jitter_amount / 100, jitter_amount / 100)
-                eased = max(0, min(1, eased + jitter))
-
-            # 计算位置
-            base_x = distance * eased
-
-            if random.random() < 0.25:
-                base_x += random.uniform(-jitter_amount, jitter_amount)
-
-            x = int(base_x)
-
-            # 计算延迟
-            if progress < 0.1:
-                delay = random.randint(DragConstants.DELAY_START_MIN, DragConstants.DELAY_START_MAX) * base_speed
-            elif progress < 0.25:
-                delay = random.randint(8, 15) * base_speed
-            elif progress < 0.7:
-                delay = random.randint(DragConstants.DELAY_MIDDLE_MIN, DragConstants.DELAY_MIDDLE_MAX) * base_speed
-            elif progress < 0.85:
-                delay = random.randint(12, 25) * base_speed
-            else:
-                delay = random.randint(DragConstants.DELAY_END_MIN, DragConstants.DELAY_END_MAX) * base_speed
-
-            tracks.append({'x': x, 'delay': delay / 1000})
-
-        # 终点精确定位
-        tracks.append({'x': distance - random.randint(1, 3), 'delay': random.randint(40, 70) / 1000})
-        tracks.append({'x': distance, 'delay': random.randint(60, 120) / 1000})
-
-        # 过冲回调
-        if random.random() < 0.4:
-            overshoot = random.randint(1, 3)
-            tracks.append({'x': distance + overshoot, 'delay': random.randint(30, 60) / 1000})
-            tracks.append({'x': distance, 'delay': random.randint(50, 100) / 1000})
-
-        return tracks
-
-    def check_captcha_passed(self, page, slider_element):
-        """
-        检查验证码是否通过
-
-        Args:
-            page: Playwright页面对象
-            slider_element: 滑块元素
-
-        Returns:
-            是否通过
-        """
-        try:
-            # 检查滑块是否消失
-            if not slider_element.is_visible():
-                print("[验证] 滑块已消失，可能通过")
-                return True
-
-            # 检查成功标志
-            result = page.evaluate("""
-                () => {
-                    const iconSelectors = [
-                        '.verify-icon-success', '.icon-success', '.success-icon',
-                        '[class*="icon-success"]', '[class*="success-icon"]',
-                        '[class*="success"]', '.success', '.passed', '.pass'
-                    ];
-
-                    for (const sel of iconSelectors) {
-                        const elem = document.querySelector(sel);
-                        if (elem && elem.offsetParent !== null) {
-                            return {type: 'icon', selector: sel};
-                        }
-                    }
-
-                    const textSelectors = ['.verify-success', '.success-text', '.pass-text'];
-                    for (const sel of textSelectors) {
-                        const elem = document.querySelector(sel);
-                        if (elem && elem.offsetParent !== null) {
-                            const text = (elem.textContent || '').trim();
-                            if (text.includes('通过') || text.includes('成功')) {
-                                return {type: 'text', selector: sel};
-                            }
-                        }
-                    }
-
-                    const container = document.querySelector('.verify-bar-area, .verify-left-bar, [class*="slider"]');
-                    if (container) {
-                        const className = container.className || '';
-                        if (className.includes('success') || className.includes('pass')) {
-                            return {type: 'container'};
-                        }
-                    }
-
-                    const mask = document.querySelector('.verify-mask, .mask');
-                    if (!mask || (mask.style && (mask.style.display === 'none' || mask.style.opacity === '0'))) {
-                        return {type: 'mask_gone'};
-                    }
-
-                    return null;
-                }
-            """)
-
-            if result:
-                print(f"[验证] 检测到通过状态: {result}")
-                return True
-
-            return False
-
-        except Exception as e:
-            print(f"[验证] 检测出错: {e}")
-            return False
-
-    def check_slider_returned(self, page, slider_element):
-        """检查滑块是否回到起始位置"""
-        try:
-            slider_box = slider_element.bounding_box()
-            if not slider_box:
-                return False
-
-            track = page.query_selector(".verify-bar-area, .verify-left-bar")
-            if track:
-                track_box = track.bounding_box()
-                if track_box and abs(slider_box['x'] - track_box['x']) < 10:
-                    return True
-
-            return False
-        except:
-            return False
-
-    def solve_captcha(self, page, slider_element=None, max_attempts=None):
-        """
-        完整的验证码求解流程
-
-        Args:
-            page: Playwright页面对象
-            slider_element: 滑块元素（如果为None则自动查找）
-            max_attempts: 最大尝试次数
-
-        Returns:
-            是否验证成功
-        """
-        if slider_element is None:
-            slider_element = self.find_slider_element(page)
-            if not slider_element:
-                print("[验证码] 未找到滑块元素")
-                return False
-
-        max_attempts = max_attempts or self.captcha_solver.max_retry
-
-        print("\n" + "="*50)
-        print("开始验证码求解")
-        print("="*50)
-
-        for attempt in range(max_attempts):
-            print(f"\n=== 第 {attempt + 1}/{max_attempts} 次尝试 ===")
-
-            # 获取位置信息
-            captcha_info = self.get_captcha_positions(page, slider_element)
-            if not captcha_info:
-                print("[验证码] 无法获取位置信息")
-                break
-
-            slider_box, track_box, container_box, bg_image, block_image, img_offset = captcha_info
-
-            if not bg_image:
-                print("[验证码] 无法获取验证码图片")
-                break
-
-            # 滑块信息
-            slider_info = {
-                'x': slider_box['x'],
-                'y': slider_box['y'],
-                'width': slider_box['width'],
-                'height': slider_box['height']
-            }
-
-            # 识别缺口位置
-            result = self.captcha_solver.get_slide_distance(bg_image, block_image, slider_info)
-
-            # 解析结果
-            if isinstance(result, tuple) and len(result) >= 1:
-                gap_x_in_image = result[0]
-                gap_y_in_image = result[1] if len(result) >= 2 else None
-                confidence = result[2] if len(result) >= 3 else 0.5
-            else:
-                gap_x_in_image = result
-                gap_y_in_image = None
-                confidence = 0.5
-
-            if not gap_x_in_image:
-                print("[验证码] 未找到匹配的缺口")
-                break
-
-            # 计算距离
-            slider_left_x = slider_box['x']
-            img_offset_x = img_offset['x'] if img_offset else 0
-            gap_left_screen_x = container_box['x'] + img_offset_x + gap_x_in_image
-
-            base_distance = gap_left_screen_x - slider_left_x
-
-            print(f"[验证码] 计算距离: {base_distance:.1f}px")
-
-            # 获取自适应补偿建议
-            adjustments = self.captcha_solver.get_adaptive_suggestions(base_distance)
-            print(f"[自适应] 调整序列: {adjustments[:10]}")
-
-            tried_adjustments = set()
-            max_tries_per_attempt = 8
-
-            for adj in adjustments:
-                if adj in tried_adjustments:
-                    continue
-                if len(tried_adjustments) >= max_tries_per_attempt:
-                    break
-
-                tried_adjustments.add(adj)
-
-                final_distance = base_distance + adj
-                final_distance = max(30, min(400, final_distance))
-
-                print(f"[验证码] 滑动: {final_distance:.1f}px (调整: {adj:+d})")
-
-                if not self.simulate_drag(page, slider_element, final_distance):
-                    break
-
-                # 等待验证结果
-                time.sleep(CaptchaConstants.CAPTCHA_CHECK_WAIT)
-
-                # 检查是否通过
-                passed = self.check_captcha_passed(page, slider_element)
-                if passed:
-                    print("\n" + "="*50)
-                    print(f"[验证码] 通过! (调整: {adj:+d}px)")
-                    print("="*50)
-                    self.captcha_solver.record_result(adj, True)
-                    return True
-
-                # 检查是否失败了
-                if self.check_slider_returned(page, slider_element):
-                    print(f"[验证码] 滑块回到原位，调整值 {adj:+d} 无效，尝试下一个")
-                    self.captcha_solver.record_result(adj, False)
-                    time.sleep(0.5)
-                    continue
-
-                print("[验证码] 未通过，继续尝试...")
-                time.sleep(0.3)
-
-            # 等待验证码刷新
-            print("[验证码] 等待验证码刷新...")
-            time.sleep(2)
-
-        print("\n[验证码] 求解结束")
-        return False
-
-    def wait_and_solve(self, page, max_wait=300, check_interval=2):
-        """
-        等待验证码出现并自动求解
-
-        Args:
-            page: Playwright页面对象
-            max_wait: 最大等待时间（秒）
-            check_interval: 检查间隔（秒）
-
-        Returns:
-            是否验证成功
-        """
-        waited = 0
-
-        print("[轮询] 等待滑块验证码出现...")
-
-        while waited < max_wait:
-            slider_element = self.find_slider_element(page)
-            if slider_element:
-                print(f"\n[检测] 发现滑块验证码！(等待 {waited} 秒后)")
-                return self.solve_captcha(page, slider_element)
-
-            time.sleep(check_interval)
-            waited += check_interval
-            if waited % 10 == 0:
-                print(f"[轮询] 等待中... ({waited}/{max_wait}秒)")
-
-        print("[超时] 未检测到滑块验证码")
-        return False
-
-
-# ==================== 便捷函数 ====================
-
-def solve_captcha(page, debug=True):
-    """
-    便捷函数：求解验证码
-
-    Args:
-        page: Playwright页面对象
-        debug: 是否开启调试模式
-
-    Returns:
-        是否验证成功
-    """
-    handler = CaptchaHandler(debug=debug)
-    return handler.solve_captcha(page)
-
-
-def wait_and_solve_captcha(page, max_wait=300, debug=True):
-    """
-    便捷函数：等待并求解验证码
-
-    Args:
-        page: Playwright页面对象
-        max_wait: 最大等待时间（秒）
-        debug: 是否开启调试模式
-
-    Returns:
-        是否验证成功
-    """
-    handler = CaptchaHandler(debug=debug)
-    return handler.wait_and_solve(page, max_wait=max_wait)
-
-
-# ==================== 使用示例 ====================
-
-if __name__ == "__main__":
-    print("PMOS 滑动验证码处理模块")
-    print("\n使用方法:")
-    print("1. 导入 CaptchaHandler")
-    print("2. 创建实例: handler = CaptchaHandler(debug=True)")
-    print("3. 调用方法: handler.solve_captcha(page)")
-    print("\n或者使用便捷函数:")
-    print("  from z import solve_captcha, wait_and_solve_captcha")
-    print("  solve_captcha(page)")
